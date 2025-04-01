@@ -35,6 +35,8 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_cuda, is_hip, set_weight_attrs
 
+from sglang.srt.global_ep_tensor import EP_LOAD_TENSOR
+
 _is_cuda = is_cuda()
 
 if _is_cuda:
@@ -120,7 +122,7 @@ class EPMoE(torch.nn.Module):
 
 
     """
-
+ 
     def __init__(
         self,
         num_experts: int,
@@ -138,9 +140,11 @@ class EPMoE(torch.nn.Module):
         correction_bias: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         activation: str = "silu",
+        layer_id: int = None,
     ):
         super().__init__()
 
+        global EP_LOAD_TENSOR
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
@@ -154,6 +158,11 @@ class EPMoE(torch.nn.Module):
         self.num_experts_per_partition = self.num_experts // self.tp_size
         self.start_expert_id = self.tp_rank * self.num_experts_per_partition
         self.end_expert_id = self.start_expert_id + self.num_experts_per_partition - 1
+
+        self.layer_id = layer_id
+        self.layer_ep_load_tensor = EP_LOAD_TENSOR[self.layer_id][self.start_expert_id:self.end_expert_id+1]
+        self.layer_ep_load_tensor = {int(self.layer_ep_load_tensor[i]): i for i in range(len(self.layer_ep_load_tensor))}
+        print(f"Layer {self.layer_id} is loading, tp_rank {self.tp_rank}, load tensor for this layer: {self.layer_ep_load_tensor}")
 
         self.top_k = top_k
         self.intermediate_size = intermediate_size
@@ -406,9 +415,11 @@ class EPMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-        if expert_id < self.start_expert_id or expert_id > self.end_expert_id:
+        if expert_id not in self.layer_ep_load_tensor.keys():
             return
-        expert_id = expert_id - self.start_expert_id
+        expert_id = self.layer_ep_load_tensor[expert_id]
+        # print(f"Expert {loading_expert_id} is loading")
+        # print(f"weight_name: {weight_name}")
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(

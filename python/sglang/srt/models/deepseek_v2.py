@@ -87,6 +87,7 @@ if _is_hip:
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
+from sglang.srt.global_ep_tensor import EP_LOAD_TENSOR
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -163,6 +164,7 @@ class DeepseekV2MoE(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_id: int = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -200,6 +202,7 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             prefix=add_prefix("experts", prefix),
+            layer_id=layer_id,
         )
 
         if config.n_shared_experts is not None:
@@ -1042,10 +1045,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         if is_nextn or is_sparse_layer(layer_id):
+            print(f"Layer {layer_id} is sparse")
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                layer_id=layer_id,
             )
             self.is_sparse = True
         else:
@@ -1348,6 +1353,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
+        # print(f"params_dict: {params_dict}")
         for name, loaded_weight in weights:
             # TODO(HandH1998): Modify it when nextn is supported.
             if hasattr(self.config, "num_nextn_predict_layers"):
