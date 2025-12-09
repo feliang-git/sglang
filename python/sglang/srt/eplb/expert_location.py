@@ -26,6 +26,7 @@ import torch.distributed
 import torch.nn.functional as F
 
 from sglang.srt.eplb import eplb_algorithms
+from sglang.srt.eplb.lplb_algorithm import lplb_algorithm
 from sglang.srt.model_loader import get_model_architecture
 
 if TYPE_CHECKING:
@@ -44,6 +45,7 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    logical_to_physical_probability_map: Optional[torch.Tensor]
 
     # -------------------------------- properties ------------------------------------
 
@@ -178,6 +180,9 @@ class ExpertLocationMetadata:
             )
         )
 
+        if server_args.ep_dispatch_algorithm == "static_lp":
+            logger.info("init_expert_location from init_by_eplb using static_lp")
+            logical_to_physical_probability_map = lplb_algorithm(physical_to_logical_map, expert_count, logical_to_all_physical_map, common["ep_size"], logical_count, server_args.device)
         return ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
@@ -185,6 +190,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map.to(
                 server_args.device
             ),
+            logical_to_physical_probability_map=logical_to_physical_probability_map.to(server_args.device) if server_args.ep_dispatch_algorithm == "static_lp" else None,
         )
 
     @staticmethod
@@ -217,6 +223,7 @@ class ExpertLocationMetadata:
         ep_size: int,
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
+        logical_to_physical_probability_map: Optional[torch.Tensor] = None,
     ):
         _, num_physical_experts = physical_to_logical_map.shape
 
@@ -248,6 +255,7 @@ class ExpertLocationMetadata:
                 if server_args.ep_dispatch_algorithm == "static"
                 else None
             ),
+            logical_to_physical_probability_map=logical_to_physical_probability_map if server_args.ep_dispatch_algorithm == "static_lp" else None,
         )
 
     # -------------------------------- mutation ------------------------------------
@@ -284,9 +292,19 @@ class ExpertLocationMetadata:
     # -------------------------------- usage ------------------------------------
 
     def logical_to_all_physical(
-        self, layer_id: int, logical_expert_id: int
+        self,
+        layer_id: int,
+        logical_expert_id: int,
+        require_global_experts: bool = False,
     ) -> List[int]:
         # Use CPU copy to avoid GPU→CPU sync on every call, which is expensive in update weights scenario
+        if require_global_experts:
+            num_physical_experts = self.logical_to_all_physical_map_cpu[layer_id].shape[
+                -1
+            ]
+            return list(
+                range(logical_expert_id, num_physical_experts, self.num_logical_experts)
+            )
         return [
             physical_expert_id
             for physical_expert_id in self.logical_to_all_physical_map_cpu[
@@ -355,14 +373,10 @@ def _compute_logical_to_all_physical_map(
                 )
 
                 # Replace by the nearest physical expert
-                mapped_physical_experts = logical_to_all_physical_map[layer_id][
-                    logical_expert_id
-                ]
-                if (
-                    nearest_expert != -1
-                    and nearest_expert not in mapped_physical_experts
-                ):
-                    mapped_physical_experts[0] = nearest_expert
+                if nearest_expert != -1:
+                    logical_to_all_physical_map[layer_id][logical_expert_id] = [
+                        nearest_expert
+                    ]
 
     logical_to_all_physical_map = _pad_nested_array(
         logical_to_all_physical_map, pad_value=-1
