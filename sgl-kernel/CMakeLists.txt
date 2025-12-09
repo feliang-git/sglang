@@ -581,6 +581,106 @@ install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
 install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
         DESTINATION "deep_gemm/include/cutlass")
 
+# ============================ Extra Install: LP Solver (JIT) ============================= #
+# 1. Download MathDx
+# Execute the download script which places mathdx into ${CMAKE_CURRENT_BINARY_DIR}/mathdx
+message(STATUS "Downloading MathDx...")
+execute_process(
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/csrc/lp_solver/download-mathdx.sh ${CMAKE_CURRENT_BINARY_DIR}
+    RESULT_VARIABLE MATHDX_DOWNLOAD_RESULT
+)
+if (NOT MATHDX_DOWNLOAD_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to download MathDx")
+endif()
+
+# The script extracts to ${CMAKE_CURRENT_BINARY_DIR}/mathdx
+set(MATHDX_HOME "${CMAKE_CURRENT_BINARY_DIR}/mathdx")
+
+# Create a separate library for LP Solver's JIT compilation.
+# All dependencies are self-contained under csrc/lp_solver/
+set(LP_SOLVER_SOURCES
+    "csrc/lp_solver/jit_api.cpp"
+)
+
+# NOTE:
+# PyTorch's bundled pybind11 headers (used via `torch/extension.h`) are not
+# compatible with the CPython "stable ABI" (`Py_LIMITED_API`), which can be
+# enabled by scikit-build-core via `USE_SABI`/`SKBUILD_SABI_VERSION`.
+# Building this target with `USE_SABI` causes compile errors such as
+# `Py_buffer does not name a type` and invalid use of incomplete `PyTypeObject`.
+# To avoid this, we explicitly DO NOT use SABI for `lp_solver_cpp`.
+Python_add_library(lp_solver_cpp MODULE WITH_SOABI ${LP_SOLVER_SOURCES})
+
+# Link against necessary libraries, including nvrtc and nvJitLink for JIT compilation.
+# Note: libtorch_python is required for pybind11 type_caster symbols used by torch::Tensor
+# Get torch library directory to find libtorch_python.so
+execute_process(
+    COMMAND ${Python_EXECUTABLE} -c "import torch; import os; print(os.path.dirname(torch.__file__) + '/lib')"
+    OUTPUT_VARIABLE TORCH_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+message(STATUS "TORCH_LIB_DIR: ${TORCH_LIB_DIR}")
+
+find_library(TORCH_PYTHON_LIB torch_python PATHS ${TORCH_LIB_DIR} NO_DEFAULT_PATH)
+message(STATUS "TORCH_PYTHON_LIB: ${TORCH_PYTHON_LIB}")
+if(TORCH_PYTHON_LIB)
+    target_link_libraries(lp_solver_cpp PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIB} c10 cuda nvrtc nvJitLink)
+else()
+    # Fallback: link by library name (CMake will resolve it from LD_LIBRARY_PATH or rpath)
+    message(WARNING "libtorch_python.so not found in ${TORCH_LIB_DIR}, trying to link with default search paths")
+    target_link_libraries(lp_solver_cpp PRIVATE ${TORCH_LIBRARIES} torch_python c10 cuda nvrtc nvJitLink)
+endif()
+
+# Add include directories - all under csrc/lp_solver/mathdx/
+target_include_directories(lp_solver_cpp PRIVATE
+    ${MATHDX_HOME}/include
+    ${MATHDX_HOME}/external/cutlass/include
+)
+
+# Apply the same compile options as common_ops.
+target_compile_options(lp_solver_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+
+# Define TORCH_EXTENSION_NAME for pybind11
+target_compile_definitions(lp_solver_cpp PRIVATE TORCH_EXTENSION_NAME=lp_solver_cpp)
+
+# Create an empty __init__.py to make `lp_solver` a Python package.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/lp_solver_pkg_init.py "")
+install(
+    FILES ${CMAKE_CURRENT_BINARY_DIR}/lp_solver_pkg_init.py
+    DESTINATION lp_solver
+    RENAME __init__.py
+)
+
+# Install the compiled LP Solver API library.
+install(TARGETS lp_solver_cpp LIBRARY DESTINATION lp_solver)
+
+# Install kernel templates required by LP Solver for runtime JIT compilation.
+install(
+    DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/csrc/lp_solver/templates/
+    DESTINATION lp_solver/templates
+)
+
+# Install mathdx headers (self-contained)
+install(
+    DIRECTORY ${MATHDX_HOME}/include/
+    DESTINATION lp_solver/mathdx/include
+    PATTERN "doc" EXCLUDE
+    PATTERN "example" EXCLUDE
+)
+
+# Install mathdx CUTLASS headers
+install(
+    DIRECTORY ${MATHDX_HOME}/external/cutlass/include/
+    DESTINATION lp_solver/mathdx/external/cutlass/include
+)
+
+# Install mathdx library files (fatbin for linking)
+install(
+    DIRECTORY ${MATHDX_HOME}/lib/
+    DESTINATION lp_solver/mathdx/lib
+    PATTERN "*.a" EXCLUDE  # Don't need static libs, just fatbin
+)
+
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"

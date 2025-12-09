@@ -74,6 +74,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+from sgl_kernel.lp_solver import ipm_solve
 from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
