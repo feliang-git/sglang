@@ -351,3 +351,6 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    def get_comm_stream(self, tbo_subbatch_index: Optional[int] = None):
+        return None

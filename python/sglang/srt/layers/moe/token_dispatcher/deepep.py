@@ -830,6 +830,9 @@ class DeepEPDispatcher(BaseDispatcher):
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
 
+    def get_comm_stream(self, tbo_subbatch_index: Optional[int] = None):
+        return self._get_impl()._get_comm_stream()
+
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)

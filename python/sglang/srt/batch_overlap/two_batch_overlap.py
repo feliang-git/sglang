@@ -1035,6 +1035,11 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
 
+    def get_comm_stream(self, tbo_subbatch_index: Optional[int] = None):
+        return self._execute(
+            "get_comm_stream", tbo_subbatch_index=tbo_subbatch_index
+        )
+
     def combine(self, **kwargs) -> torch.Tensor:
         return self._execute("combine", **kwargs)
 

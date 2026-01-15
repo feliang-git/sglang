@@ -1013,41 +1013,62 @@ class DeepseekV2MoE(nn.Module):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
         tbo_subbatch_index = state.get("tbo_subbatch_index")
-        if self.gate_event_0 is not None and tbo_subbatch_index is not None:
-            if tbo_subbatch_index == 0:
-                self.gate_event_0.wait()
-            elif tbo_subbatch_index == 1:
-                self.gate_event_1.wait()
-        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
-            layer_id=self.layer_id
+        comm_stream = (
+            self.experts.dispatcher.get_comm_stream(tbo_subbatch_index)
+            if self._lp_dispatch
+            else None
         )
+        stream_ctx = (
+            torch.cuda.stream(comm_stream) if comm_stream is not None else nullcontext()
+        )
+        with stream_ctx:
+            if self.gate_event_0 is not None and tbo_subbatch_index is not None:
+                if tbo_subbatch_index == 0:
+                    self.gate_event_0.wait()
+                elif tbo_subbatch_index == 1:
+                    self.gate_event_1.wait()
+            expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id
+            )
 
-        if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
-                state.topk_output = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=expert_location_dispatch_info,
-                    lp_dispatch=self._lp_dispatch,
-                )
-        else:
-            if self._lp_dispatch:
-                get_log2phy_prob(
-                    torch.tensor([[]], device=hidden_states.device),
-                    expert_location_dispatch_info,
-                )
-            state.topk_output = self.topk.empty_topk_output(hidden_states.device)
+            if router_logits is not None:
+                with get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                ):
+                    state.topk_output = self.topk(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        num_token_non_padded=state.forward_batch.num_token_non_padded,
+                        expert_location_dispatch_info=expert_location_dispatch_info,
+                        lp_dispatch=self._lp_dispatch,
+                    )
+            else:
+                if self._lp_dispatch:
+                    get_log2phy_prob(
+                        torch.tensor([[]], device=hidden_states.device),
+                        expert_location_dispatch_info,
+                    )
+                state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
-            self.experts.dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_output=state.pop("topk_output"),
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
+            tbo_subbatch_index = state.get("tbo_subbatch_index")
+            comm_stream = (
+                self.experts.dispatcher.get_comm_stream(tbo_subbatch_index)
+                if self._lp_dispatch
+                else None
             )
+            stream_ctx = (
+                torch.cuda.stream(comm_stream)
+                if comm_stream is not None
+                else nullcontext()
+            )
+            with stream_ctx:
+                self.experts.dispatcher.dispatch_a(
+                    hidden_states=state.hidden_states_mlp_input,
+                    topk_output=state.pop("topk_output"),
+                    tbo_subbatch_index=tbo_subbatch_index,
+                )
 
     def op_dispatch_b(self, state):
         if self.ep_size > 1:
