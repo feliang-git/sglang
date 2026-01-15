@@ -18,12 +18,13 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.lp_matrices_prep import get_global_token_dispatch_metadata
 from sglang.srt.server_args import get_global_server_args
 
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "random", "dynamic", "fake", "lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -31,11 +32,25 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # (num_logical_experts, X)
+    # lp dispatch metadata
+    A: Optional[torch.Tensor]
+    B1: Optional[torch.Tensor]
+    B2: Optional[torch.Tensor]
+    c: Optional[torch.Tensor]
+    log_single_expert_array: Optional[torch.Tensor]
+    phy_single_expert_array: Optional[torch.Tensor]
+    log_replicated_expert_array: Optional[torch.Tensor]
+    phy_replicated_expert_array: Optional[torch.Tensor]
 
     @classmethod
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
+        if ep_dispatch_algorithm == "lp":
+            lp_metadata = get_global_token_dispatch_metadata()
+        else:
+            lp_metadata = None
         assert expert_location_metadata is not None
 
         if ep_dispatch_algorithm is None:
@@ -58,6 +73,14 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            A=lp_metadata.A[layer_id] if lp_metadata is not None else None,
+            B1=lp_metadata.B1[layer_id] if lp_metadata is not None else None,
+            B2=lp_metadata.B2[layer_id] if lp_metadata is not None else None,
+            c=lp_metadata.c[layer_id] if lp_metadata is not None else None,
+            log_single_expert_array=lp_metadata.log_single_expert_array[layer_id] if lp_metadata is not None else None,
+            phy_single_expert_array=lp_metadata.phy_single_expert_array[layer_id] if lp_metadata is not None else None,
+            log_replicated_expert_array=lp_metadata.log_replicated_expert_array[layer_id] if lp_metadata is not None else None,
+            phy_replicated_expert_array=lp_metadata.phy_replicated_expert_array[layer_id] if lp_metadata is not None else None,
         )
 
 
@@ -74,7 +97,9 @@ def transform_select_experts_inputs(
 
 
 def topk_ids_logical_to_physical(
-    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    logical_expert_probabilities: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if info is None:
         return topk_ids
@@ -83,6 +108,12 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "lp" and logical_expert_probabilities is not None:
+        return _topk_ids_logical_to_physical_probability(
+            topk_ids, info, logical_expert_probabilities
+        )
+    elif info.ep_dispatch_algorithm == "lp":
+        raise ValueError("lp_dispatch is True, but logical_expert_probabilities is None")
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -105,5 +136,38 @@ def _topk_ids_logical_to_physical_dynamic(
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
 
+    topk_ids = topk_ids.view(topk_ids_original_shape)
+    return topk_ids
+
+
+def _topk_ids_logical_to_physical_probability(
+    topk_ids: torch.Tensor,
+    info: ExpertLocationDispatchInfo,
+    logical_expert_probabilities: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Select physical experts based on probability distribution for each logical expert.
+
+    Args:
+        topk_ids: Logical expert IDs (num_tokens, topk)
+        info: Expert location dispatch information
+        logical_expert_probabilities: Probability distribution tensor with same shape as
+                                     logical_to_all_physical_map (num_logical_experts, max_physical_per_logical)
+                                     Each element represents probability of selecting that physical expert
+                                     0 indicates no such physical expert
+
+    Returns:
+        Physical expert IDs with same shape as topk_ids
+    """
+    topk_ids_original_shape = topk_ids.shape
+    device = topk_ids.device
+    topk_ids = topk_ids.flatten()
+
+    log2phy_map = info.partial_logical_to_all_physical_map
+    topk_probs = logical_expert_probabilities[topk_ids]
+
+    chosen_dispatch_index = torch.multinomial(topk_probs.float(), 1).flatten()
+
+    topk_ids = log2phy_map[topk_ids, chosen_dispatch_index]
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
