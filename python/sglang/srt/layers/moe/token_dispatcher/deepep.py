@@ -355,6 +355,9 @@ class _DeepEPDispatcherImplBase:
     def _get_buffer(self):
         raise NotImplementedError
 
+    def _get_comm_stream(self):
+        return self._get_buffer().get_comm_stream()
+
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
 
