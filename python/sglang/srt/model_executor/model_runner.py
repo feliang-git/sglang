@@ -73,6 +73,10 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
+from sglang.srt.eplb.lp_matrices_prep import (
+    TokenDispatchMetadata,
+    set_global_token_dispatch_metadata,
+)
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
@@ -441,6 +445,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     rank=self.tp_rank,
                 )
             )
+            if self.server_args.ep_dispatch_algorithm == "lp":
+                set_global_token_dispatch_metadata(
+                    TokenDispatchMetadata.init(
+                        get_global_expert_location_metadata().physical_to_logical_map,
+                        get_global_expert_location_metadata().logical_to_all_physical_map,
+                        get_global_expert_location_metadata().ep_size,
+                    )
+                )
 
         # Expert parallelism
         self.eplb_manager = (
@@ -1014,6 +1026,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 update_layer_ids=update_layer_ids,
                 nnodes=self.server_args.nnodes,
                 rank=self.tp_rank,
+            )
+        if self.server_args.ep_dispatch_algorithm == "lp":
+            set_global_token_dispatch_metadata(
+                TokenDispatchMetadata.init(
+                    get_global_expert_location_metadata().physical_to_logical_map,
+                    get_global_expert_location_metadata().logical_to_all_physical_map,
+                    get_global_expert_location_metadata().ep_size,
+                )
             )
 
     def update_weights_from_disk(
