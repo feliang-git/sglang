@@ -5,7 +5,7 @@ import time
 
 from sglang.srt.distributed import get_world_group, get_moe_ep_group
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.eplb.lpkernel.lplb.minilp import solve_ipm
+from lplb.minilp import solve_ipm
 
 
 def run_lp_solver(
