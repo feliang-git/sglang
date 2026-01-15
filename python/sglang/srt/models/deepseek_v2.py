@@ -53,6 +53,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.eplb.lp_token_dispatch import get_log2phy_prob
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -434,6 +435,12 @@ class DeepseekV2MoE(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        self.gate_event_0 = (
+            torch.cuda.Event() if torch.cuda.is_available() else None
+        )
+        self.gate_event_1 = (
+            torch.cuda.Event() if torch.cuda.is_available() else None
+        )
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -584,6 +591,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._lp_dispatch = get_global_server_args().ep_dispatch_algorithm == "lp"
 
     def get_moe_weights(self):
         return [
@@ -803,6 +811,9 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         shared_output = None
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=self.layer_id
+        )
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -827,11 +838,15 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                lp_dispatch=self._lp_dispatch,
             )
         else:
+            if self._lp_dispatch:
+                get_log2phy_prob(
+                    torch.tensor([[]], device=hidden_states.device),
+                    expert_location_dispatch_info,
+                )
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         if sbo_overlap_dispatch_flag:
@@ -978,6 +993,12 @@ class DeepseekV2MoE(nn.Module):
             state.router_logits = self.gate(state.hidden_states_mlp_input)
         else:
             state.router_logits = None
+        tbo_subbatch_index = state.get("tbo_subbatch_index")
+        if self.gate_event_0 is not None and tbo_subbatch_index is not None:
+            if tbo_subbatch_index == 0:
+                self.gate_event_0.record()
+            elif tbo_subbatch_index == 1:
+                self.gate_event_1.record()
 
     def op_shared_experts(self, state):
         hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
@@ -991,6 +1012,15 @@ class DeepseekV2MoE(nn.Module):
     def op_select_experts(self, state):
         router_logits = state.pop("router_logits")
         hidden_states = state.hidden_states_mlp_input
+        tbo_subbatch_index = state.get("tbo_subbatch_index")
+        if self.gate_event_0 is not None and tbo_subbatch_index is not None:
+            if tbo_subbatch_index == 0:
+                self.gate_event_0.wait()
+            elif tbo_subbatch_index == 1:
+                self.gate_event_1.wait()
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=self.layer_id
+        )
 
         if router_logits is not None:
             with get_global_expert_distribution_recorder().with_current_layer(
@@ -1000,11 +1030,15 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    lp_dispatch=self._lp_dispatch,
                 )
         else:
+            if self._lp_dispatch:
+                get_log2phy_prob(
+                    torch.tensor([[]], device=hidden_states.device),
+                    expert_location_dispatch_info,
+                )
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):
