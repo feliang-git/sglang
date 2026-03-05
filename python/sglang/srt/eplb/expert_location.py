@@ -42,8 +42,10 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_cpu: torch.Tensor  # CPU copy for performance
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
+    logical_to_physical_probability: Optional[torch.Tensor] = None  # (layers, num_logical_experts, X)
+    logical_to_physical_dispatch_table: Optional[torch.Tensor] = None  # (layers, num_logical_experts, TABLE_SIZE)
     # (layers, num_logical_experts)
-    logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None
 
     # -------------------------------- properties ------------------------------------
 
@@ -178,7 +180,7 @@ class ExpertLocationMetadata:
             )
         )
 
-        return ExpertLocationMetadata._init_raw(
+        metadata = ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(server_args.device),
@@ -186,6 +188,17 @@ class ExpertLocationMetadata:
                 server_args.device
             ),
         )
+
+        if server_args.ep_dispatch_algorithm == "static_lp":
+            metadata.logical_to_physical_probability = (
+                compute_logical_to_physical_probability(
+                    expert_location_metadata=metadata,
+                    logical_count=logical_count,
+                    server_args=server_args,
+                )
+            )
+
+        return metadata
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
@@ -268,6 +281,8 @@ class ExpertLocationMetadata:
             "logical_to_all_physical_map",
             "logical_to_all_physical_map_cpu",
             "logical_to_all_physical_map_num_valid",
+            "logical_to_physical_probability",
+            "logical_to_physical_dispatch_table",
             "logical_to_rank_dispatch_physical_map",
         ]:
             other_field = getattr(other, field)
@@ -571,3 +586,132 @@ def compute_initial_expert_location_metadata(
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"
         )
+
+
+def load_logical_count_from_init_expert_location(
+    server_args: ServerArgs,
+) -> Optional[torch.Tensor]:
+    """Load token-per-expert counts from the init_expert_location file."""
+    data = server_args.init_expert_location
+    if not data or data == "trivial":
+        return None
+
+    if data.endswith(".pt"):
+        data_dict = torch.load(data, weights_only=True)
+    elif data.endswith(".json"):
+        data_dict = json.loads(Path(data).read_text())
+    else:
+        data_dict = json.loads(data)
+
+    logical_count = data_dict.get("logical_count")
+    if logical_count is None:
+        return None
+    if not isinstance(logical_count, torch.Tensor):
+        logical_count = torch.tensor(logical_count)
+    if logical_count.dim() == 3:
+        logical_count = logical_count.sum(dim=0)
+    return logical_count
+
+
+_DISPATCH_TABLE_SIZE = 256
+
+
+def compute_logical_to_physical_probability(
+    expert_location_metadata: ExpertLocationMetadata,
+    logical_count: torch.Tensor,
+    server_args: ServerArgs,
+) -> torch.Tensor:
+    """Compute LP-based dispatch probabilities and build the dispatch table.
+
+    Solves a min-max load balancing LP for each layer, then quantizes
+    the resulting probabilities into a lookup table for O(1) runtime dispatch.
+    Also sets expert_location_metadata.logical_to_physical_dispatch_table.
+    """
+    from sglang.srt.eplb.lplb_algorithm import lplb_algorithm
+
+    if not isinstance(logical_count, torch.Tensor):
+        logical_count = torch.tensor(logical_count)
+    if logical_count.dim() == 3:
+        logical_count = logical_count.sum(dim=0)
+    elif logical_count.dim() == 1:
+        logical_count = logical_count.unsqueeze(0)
+    elif logical_count.dim() == 0:
+        raise ValueError("logical_count must have at least 1 dimension.")
+
+    logical_to_all_physical_map = expert_location_metadata.logical_to_all_physical_map
+    log2phy_prob = lplb_algorithm(
+        phy2log=expert_location_metadata.physical_to_logical_map,
+        logcnt=expert_location_metadata.logical_to_all_physical_map_num_valid,
+        log2phy=logical_to_all_physical_map,
+        g=expert_location_metadata.ep_size,
+        logical_count=logical_count.to(server_args.device),
+        device=server_args.device,
+    )
+    log2phy_prob = log2phy_prob.masked_fill(logical_to_all_physical_map < 0, 0)
+    row_sums = log2phy_prob.sum(dim=-1, keepdim=True)
+    valid_mask = logical_to_all_physical_map >= 0
+    num_valid = expert_location_metadata.logical_to_all_physical_map_num_valid.to(
+        server_args.device
+    ).unsqueeze(-1)
+    # Fallback to uniform for experts with zero token count
+    needs_fix = row_sums <= 0
+    if needs_fix.any():
+        uniform = torch.where(
+            valid_mask,
+            1.0 / torch.clamp(num_valid, min=1),
+            torch.zeros_like(log2phy_prob),
+        )
+        log2phy_prob = torch.where(needs_fix, uniform, log2phy_prob)
+
+    expert_location_metadata.logical_to_physical_dispatch_table = (
+        _build_dispatch_table(log2phy_prob, logical_to_all_physical_map)
+    )
+
+    return log2phy_prob
+
+
+def _build_dispatch_table(
+    log2phy_prob: torch.Tensor,
+    logical_to_all_physical_map: torch.Tensor,
+) -> torch.Tensor:
+    """Build a dispatch table: (layer, expert, random_index) -> physical_expert_id.
+
+    Each logical expert gets TABLE_SIZE entries distributed proportionally
+    to its LP probabilities. At runtime, dispatch is just:
+        randint(TABLE_SIZE) + 2D gather
+    """
+    import numpy as np
+
+    device = log2phy_prob.device
+    num_layers, num_experts, num_slots = log2phy_prob.shape
+    T = _DISPATCH_TABLE_SIZE
+
+    row_sums = log2phy_prob.sum(dim=-1, keepdim=True).clamp(min=1e-30)
+    norm_prob = log2phy_prob / row_sums
+
+    # Quantize probabilities into table entry counts per slot,
+    # assigning remainder to the slot with the largest fractional part
+    counts = (norm_prob * T).floor().long()
+    remainder = T - counts.sum(dim=-1, keepdim=True)
+    frac = (norm_prob * T) - counts.float()
+    frac = frac.masked_fill(log2phy_prob == 0, -1.0)
+    _, max_frac_idx = frac.max(dim=-1, keepdim=True)
+    counts.scatter_add_(-1, max_frac_idx, remainder)
+
+    table = torch.zeros(num_layers, num_experts, T, dtype=torch.int64)
+    counts_np = counts.cpu().numpy()
+    phy_map_np = logical_to_all_physical_map.cpu().numpy()
+
+    for layer_id in range(num_layers):
+        for expert_id in range(num_experts):
+            pos = 0
+            for slot in range(num_slots):
+                c = int(counts_np[layer_id, expert_id, slot])
+                phy_id = int(phy_map_np[layer_id, expert_id, slot])
+                if c > 0 and phy_id >= 0:
+                    table[layer_id, expert_id, pos:pos + c] = phy_id
+                    pos += c
+            if pos < T and pos > 0:
+                table[layer_id, expert_id, pos:] = table[layer_id, expert_id, pos - 1]
+
+    return table.to(device)

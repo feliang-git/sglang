@@ -23,13 +23,17 @@ from sglang.srt.server_args import get_global_server_args
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "random", "static_lp"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
     partial_logical_to_all_physical_map: torch.Tensor
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
+    # (num_logical_experts, X)
+    partial_logical_to_physical_probability: Optional[torch.Tensor]
+    # (num_logical_experts, TABLE_SIZE)
+    partial_logical_to_physical_dispatch_table: Optional[torch.Tensor]
     num_physical_experts: int
 
     @classmethod
@@ -40,6 +44,15 @@ class ExpertLocationDispatchInfo:
 
         if ep_dispatch_algorithm is None:
             return None
+
+        if (
+            ep_dispatch_algorithm == "static_lp"
+            and expert_location_metadata.logical_to_physical_dispatch_table is None
+        ):
+            raise ValueError(
+                "ep_dispatch_algorithm=static_lp requires logical_to_physical_dispatch_table. "
+                "Provide init_expert_location with logical_count or avoid static_lp."
+            )
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -57,6 +70,12 @@ class ExpertLocationDispatchInfo:
             partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
                 layer_id, :
             ],
+            partial_logical_to_physical_probability=expert_location_metadata.logical_to_physical_probability[
+                layer_id, :
+            ] if expert_location_metadata.logical_to_physical_probability is not None else None,
+            partial_logical_to_physical_dispatch_table=expert_location_metadata.logical_to_physical_dispatch_table[
+                layer_id, :
+            ] if expert_location_metadata.logical_to_physical_dispatch_table is not None else None,
             num_physical_experts=expert_location_metadata.num_physical_experts,
         )
 
@@ -83,6 +102,8 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "static_lp":
+        return _topk_ids_logical_to_physical_lplb(topk_ids, info)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -104,6 +125,25 @@ def _topk_ids_logical_to_physical_dynamic(
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
     )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+
+    topk_ids = topk_ids.view(topk_ids_original_shape)
+    return topk_ids
+
+
+def _topk_ids_logical_to_physical_lplb(
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+) -> torch.Tensor:
+    """Dispatch via pre-computed table: randint selects a physical expert
+    according to LP-optimized probabilities."""
+    topk_ids_original_shape = topk_ids.shape
+    topk_ids = topk_ids.flatten()
+
+    dispatch_table = info.partial_logical_to_physical_dispatch_table
+    table_size = dispatch_table.shape[-1]
+    rand_idx = torch.randint(
+        0, table_size, topk_ids.shape, dtype=torch.int64, device=topk_ids.device
+    )
+    topk_ids = dispatch_table[topk_ids, rand_idx]
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
