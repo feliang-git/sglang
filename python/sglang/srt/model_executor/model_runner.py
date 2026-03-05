@@ -82,7 +82,9 @@ from sglang.srt.eplb.expert_distribution import (
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     compute_initial_expert_location_metadata,
+    compute_logical_to_physical_probability,
     get_global_expert_location_metadata,
+    load_logical_count_from_init_expert_location,
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
@@ -458,13 +460,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(
-                    server_args=server_args,
-                    model_config=self.model_config,
-                    moe_ep_rank=self.moe_ep_rank,
-                )
+            expert_location_metadata = compute_initial_expert_location_metadata(
+                server_args=server_args,
+                model_config=self.model_config,
+                moe_ep_rank=self.moe_ep_rank,
             )
+            # Compute LP-based dispatch probabilities for static_lp
+            if (
+                expert_location_metadata is not None
+                and server_args.ep_dispatch_algorithm == "static_lp"
+            ):
+                logical_count = load_logical_count_from_init_expert_location(
+                    server_args
+                )
+                if logical_count is None:
+                    raise ValueError(
+                        "ep_dispatch_algorithm=static_lp requires logical_count in init_expert_location."
+                    )
+                expert_location_metadata.logical_to_physical_probability = (
+                    compute_logical_to_physical_probability(
+                        expert_location_metadata=expert_location_metadata,
+                        logical_count=logical_count,
+                        server_args=server_args,
+                    )
+                )
+            set_global_expert_location_metadata(expert_location_metadata)
             if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
                 logger.info(
                     f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
