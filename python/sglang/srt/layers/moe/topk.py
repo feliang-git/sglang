@@ -956,7 +956,19 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        # LP dispatch: solve LP outside torch.compile to get probability-based routing.
+        # The solver contains an EP all-reduce that cannot run inside torch.compile.
+        log2phy_prob = None
+        if (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lp"
+            and expert_location_dispatch_info.lplb_solver is not None
+        ):
+            log2phy_prob = expert_location_dispatch_info.lplb_solver.solve(topk_ids)
+
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids, expert_location_dispatch_info, log2phy_prob
+        )
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
     if num_fused_shared_experts > 0 and _use_aiter:
