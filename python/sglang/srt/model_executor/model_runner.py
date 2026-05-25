@@ -588,6 +588,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
+        # LP-CF (moe_load_balancer-backed): per-layer runtimes count
+        # logical-expert hits, optionally all-reduce, drive the closed-
+        # form pair-split kernel and the multinomial dispatch.
+        if (
+            self.server_args.ep_dispatch_algorithm == "lpcf"
+            and not self.is_draft_worker
+        ):
+            self._init_lpcf_runtimes()
+
         (
             ElasticEPStateManager.init(self.server_args)
             if self.server_args.elastic_ep_backend
@@ -1418,6 +1427,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
 
+    def _init_lpcf_runtimes(self):
+        """Build one LPCFRuntime per MoE layer and register it globally.
+
+        Wraps the moe_load_balancer SDK's LPCFL2Router. Each runtime owns
+        the live ``ExpertLocationMetadata`` view via a shared
+        SGLangPlacementAdapter; the adapter's ``placement_version`` is
+        bumped on EPLB rebalance so cached placement-derived state inside
+        the router rebuilds on the next call.
+        """
+        from sglang.srt.distributed import get_moe_ep_group
+
+        from moe_load_balancer.adapters.sglang import SGLangPlacementAdapter
+        from moe_load_balancer.adapters.sglang.lpcf.runtime import LPCFRuntime
+        from sglang.srt.eplb.moelb_lpcf_registry import (
+            clear_global_lpcf_runtimes,
+            set_global_lpcf_runtime,
+        )
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return
+
+        self._lpcf_placement_adapter = SGLangPlacementAdapter(metadata)
+
+        clear_global_lpcf_runtimes()
+        ep_group = get_moe_ep_group()
+
+        for lid in range(metadata.num_layers):
+            runtime = LPCFRuntime(
+                layer_id=lid,
+                ep_group=ep_group,
+                num_logical_experts=metadata.num_logical_experts,
+                num_physical_experts=metadata.num_physical_experts,
+                num_gpus=metadata.ep_size,
+                placement_provider=self._lpcf_placement_adapter,
+            )
+            set_global_lpcf_runtime(lid, runtime)
+
+        logger.info(
+            f"Initialized {metadata.num_layers} LP-CF runtimes "
+            f"(num_logical={metadata.num_logical_experts}, "
+            f"num_physical={metadata.num_physical_experts}, "
+            f"ep_size={metadata.ep_size})."
+        )
+
     def update_expert_location(
         self,
         new_expert_location_metadata: ExpertLocationMetadata,
@@ -1459,6 +1513,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+        # LP-CF: bump the placement adapter's version after EPLB rebalances
+        # so each runtime's router rebuilds cached placement-derived state.
+        if (
+            self.server_args.ep_dispatch_algorithm == "lpcf"
+            and getattr(self, "_lpcf_placement_adapter", None) is not None
+        ):
+            self._lpcf_placement_adapter.bump_version()
 
     def update_weights_from_disk(
         self,

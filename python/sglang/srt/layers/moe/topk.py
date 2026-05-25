@@ -1036,6 +1036,48 @@ def _remap_topk_for_deepep(
     return topk_ids, topk_weights
 
 
+def _post_process_topk_ids_via_lpcf_runtime(
+    *,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    router_logits: torch.Tensor,
+    num_token_non_padded,
+    runtime,
+    num_fused_shared_experts: int,
+) -> torch.Tensor:
+    """Drive the moe_load_balancer LPCFRuntime for the routed-expert columns.
+
+    Fused shared-expert columns are stripped before the runtime call and
+    re-appended after; the shared-column value (= n_routed_experts) is out
+    of range for the logical->physical table, same convention as the
+    static / dynamic paths.
+    """
+    if num_fused_shared_experts > 0:
+        shared_cols = topk_ids[:, -num_fused_shared_experts:]
+        routed_cols = topk_ids[:, :-num_fused_shared_experts]
+        routed_weights = topk_weights[:, :-num_fused_shared_experts]
+    else:
+        shared_cols = None
+        routed_cols = topk_ids
+        routed_weights = topk_weights
+
+    routed_output = StandardTopKOutput(
+        topk_weights=routed_weights, topk_ids=routed_cols, router_logits=router_logits
+    )
+    materialized = runtime.route(
+        routed_output, num_token_non_padded=num_token_non_padded
+    )
+    routed_cols = materialized.topk_ids
+
+    if shared_cols is not None:
+        topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+    else:
+        topk_ids = routed_cols
+
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_ids
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1054,11 +1096,27 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
+        # LP-CF path: the moe_load_balancer LPCFRuntime runs the whole
+        # pipeline (count -> optional EP all-reduce -> CF solve ->
+        # multinomial dispatch) and writes physical expert ids directly.
+        if (
+            expert_location_dispatch_info is not None
+            and expert_location_dispatch_info.ep_dispatch_algorithm == "lpcf"
+            and expert_location_dispatch_info.lpcf_runtime is not None
+        ):
+            topk_ids = _post_process_topk_ids_via_lpcf_runtime(
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                router_logits=router_logits,
+                num_token_non_padded=num_token_non_padded,
+                runtime=expert_location_dispatch_info.lpcf_runtime,
+                num_fused_shared_experts=num_fused_shared_experts,
+            )
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
         # The shared expert column (value = n_routed_experts) would be out-of-bounds
         # for the logical-to-physical dispatch table.
-        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+        elif num_fused_shared_experts > 0 and is_deepep_class_backend():
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(

@@ -838,6 +838,30 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
         else:
+            # Empty-token branch: when LP-CF runs with global-count mode
+            # (LPCF_USE_GLOBAL_COUNT=1) it does an EP all-reduce inside
+            # route(); every rank must participate or the collective
+            # deadlocks under DP-attention. The default local-count path
+            # has no collective and exits the runtime cheaply on empty
+            # input, so this is safe in both modes.
+            _info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if _info is not None and _info.lpcf_runtime is not None:
+                topk = self.top_k
+                _empty_ids = torch.empty(
+                    (0, topk), dtype=torch.int32, device=hidden_states.device
+                )
+                _empty_weights = torch.empty(
+                    (0, topk), dtype=torch.float32, device=hidden_states.device
+                )
+                _empty_logits = torch.empty(
+                    (0, topk), dtype=torch.float32, device=hidden_states.device
+                )
+                from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+                _info.lpcf_runtime.route(
+                    StandardTopKOutput(_empty_weights, _empty_ids, _empty_logits)
+                )
+
             topk_output = self.topk.empty_topk_output(hidden_states.device)
             if is_deepep_class_backend() and self.num_fused_shared_experts > 0:
                 n = self.num_fused_shared_experts
@@ -1073,6 +1097,26 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
         else:
+            # Same empty-rank participation as forward_deepep — see comment
+            # there. No-op when LP-CF is not enabled.
+            _info = ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if _info is not None and _info.lpcf_runtime is not None:
+                topk = self.top_k
+                _empty_ids = torch.empty(
+                    (0, topk), dtype=torch.int32, device=hidden_states.device
+                )
+                _empty_weights = torch.empty(
+                    (0, topk), dtype=torch.float32, device=hidden_states.device
+                )
+                _empty_logits = torch.empty(
+                    (0, topk), dtype=torch.float32, device=hidden_states.device
+                )
+                from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+                _info.lpcf_runtime.route(
+                    StandardTopKOutput(_empty_weights, _empty_ids, _empty_logits)
+                )
+
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
 
     def op_dispatch_a(self, state):

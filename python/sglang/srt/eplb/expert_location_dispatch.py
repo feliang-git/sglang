@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -23,7 +23,7 @@ from sglang.srt.server_args import get_global_server_args
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    ep_dispatch_algorithm: Literal["static", "random"]
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lpcf"]
     # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # (num_logical_experts, X)
@@ -31,6 +31,10 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # Per-layer LP-CF runtime when ep_dispatch_algorithm == "lpcf";
+    # ``None`` otherwise. Typed loosely so this dataclass does not pull in
+    # moe_load_balancer at import time.
+    lpcf_runtime: object = field(default=None, repr=False)
 
     @classmethod
     def init_new(cls, layer_id: int):
@@ -40,6 +44,12 @@ class ExpertLocationDispatchInfo:
 
         if ep_dispatch_algorithm is None:
             return None
+
+        lpcf_runtime = None
+        if ep_dispatch_algorithm == "lpcf":
+            from sglang.srt.eplb.moelb_lpcf_registry import get_global_lpcf_runtime
+
+            lpcf_runtime = get_global_lpcf_runtime(layer_id)
 
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
@@ -58,6 +68,7 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            lpcf_runtime=lpcf_runtime,
         )
 
 
@@ -83,6 +94,15 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "lpcf":
+        # LP-CF dispatch happens upstream in topk._post_process_topk_ids,
+        # where the per-layer LPCFRuntime runs the full pipeline (count +
+        # optional AR + solve + dispatch) and writes physical IDs directly.
+        raise RuntimeError(
+            "topk_ids_logical_to_physical called with ep_dispatch_algorithm=\'lpcf\'; "
+            "the LP-CF path is materialized inside topk._post_process_topk_ids "
+            "via LPCFRuntime.route — this function must not be reached for LP-CF."
+        )
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
